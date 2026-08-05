@@ -4,39 +4,43 @@ ball_tracking.analysis.calibration
 Turns the two detected stump groups (bowling end = near = large in
 frame, batting end = far = small in frame — this camera sits behind
 the bowler's stumps looking down the pitch) into a pixel <-> real-world
-ground-plane mapping.
+ground-plane mapping, via a single planar homography.
 
-Two different, axis-appropriate techniques are used:
+The prepared pitch strip is a flat rectangle lying on the ground, so
+the true pixel <-> real-world mapping for every point on it is
+*exactly* one projective transform (homography) — a single consistent
+model for both along-pitch and lateral directions, rather than two
+separately-fitted approximations. It's fully determined by four point
+correspondences: the two real corners of the pitch boundary
+(+-1.525 m from the centre line) at each wicket, in both their known
+metric ground coordinates and their pixel positions.
 
-- **Along the pitch** (uses stump *height*): the ground line through
-  both stump bases and the line through both stump tops (0.711 m up)
-  are images of two real, parallel 3-D lines. Their intersection is the
-  vanishing point of the pitch-length direction. Combined with the
-  known 20.12 m pitch length, this gives a projective (cross-ratio)
-  pixel <-> metres map along the centre line.
-- **Across the pitch** (uses stump *width*): for this camera placement
-  (centred behind the stumps, looking straight down the lane — the
-  common case for a fixed practice-net rig), the two stump-group width
-  lines land exactly horizontal in the image, i.e. their vanishing
-  point is at infinity and can't be intersected. Real lateral distance
-  instead scales with a perspective (Möbius) function of along-pitch
-  position, fitted from the two known width measurements (0.2286 m at
-  each end); a point's lateral offset is its horizontal pixel distance
-  from the centre line, divided by that position's interpolated
-  pixels-per-metre scale.
+Those four pixel corners aren't directly observable (only the stumps
+are detected) — they're estimated the same way the lateral scale
+always was here: each wicket's own stump height in pixels, divided by
+the real 0.711 m stump height, gives that end's local pixels-per-metre
+scale (independent of the other end, no shared vanishing point
+needed); the real 3.05 m pitch width scaled by that factor, projected
+outward from the stump base along the image-plane perpendicular to the
+(straight) centre-line direction, gives that end's two boundary
+corners.
 
-This intentionally avoids fitting a general 4-point homography from the
-raw stump corners: that quadrilateral is ~0.23 m wide by ~20 m long, so
-a homography fit from it would extrapolate pixel noise in the short
-(lateral) direction by an order of magnitude once used to draw the
-~3 m-wide pitch overlay. Both techniques above only ever use the stump
-width/height as a *scale factor* or a *line direction*, never as raw
-corner positions to extrapolate from.
+Once those four correspondences are known, `cv2.getPerspectiveTransform`
+solves the exact 3x3 homography (8 degrees of freedom = 4 point
+pairs), and every other pitch marking — length markers, creases, wide
+guidelines, return creases — is just a `pitch_to_pixel` call on its
+known metric coordinates. Length-marker spacing shrinks correctly
+(non-linearly) toward the horizon for free, because that is what a
+homography does to equally-spaced collinear points; no separate
+cross-ratio machinery is needed for that.
 """
 
 import math
 from dataclasses import dataclass
 from typing import List, Sequence, Tuple
+
+import cv2
+import numpy as np
 
 from ball_tracking.core import config
 from ball_tracking.core.logger import get_logger
@@ -47,101 +51,6 @@ logger = get_logger(__name__)
 Point = Tuple[float, float]
 
 _EPS = 1e-9
-
-
-# --------------------------------------------------------------------------- #
-# Generic 2-D line / projective helpers
-# --------------------------------------------------------------------------- #
-def line_intersection(a1: Point, a2: Point, b1: Point, b2: Point):
-    """Return the intersection of line (a1,a2) with line (b1,b2), or None if parallel."""
-    x1, y1 = a1
-    x2, y2 = a2
-    x3, y3 = b1
-    x4, y4 = b2
-
-    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-    if abs(denom) < _EPS:
-        return None
-
-    a = x1 * y2 - y1 * x2
-    b = x3 * y4 - y3 * x4
-    px = ((x1 - x2) * b - (x3 - x4) * a) / denom
-    py = ((y1 - y2) * b - (y3 - y4) * a) / denom
-    return (px, py)
-
-
-def signed_param(point: Point, origin: Point, through: Point) -> float:
-    """Signed distance of *point* from *origin*, measured along the line origin->through.
-
-    `origin` always maps to 0.0 and `through` always maps to +||through-origin||.
-    The three points are assumed collinear (or nearly so).
-    """
-    ox, oy = origin
-    tx, ty = through
-    dx, dy = tx - ox, ty - oy
-    length = math.hypot(dx, dy)
-    if length < _EPS:
-        raise ValueError("Degenerate reference line: origin and through-point coincide.")
-    ux, uy = dx / length, dy / length
-    return (point[0] - ox) * ux + (point[1] - oy) * uy
-
-
-def point_at_param(origin: Point, through: Point, t: float) -> Point:
-    """Inverse of `signed_param`: the point at distance *t* from origin, towards through."""
-    ox, oy = origin
-    tx, ty = through
-    length = math.hypot(tx - ox, ty - oy)
-    ux, uy = (tx - ox) / length, (ty - oy) / length
-    return (ox + ux * t, oy + uy * t)
-
-
-def real_from_param(t: float, t_a: float, x_a: float, t_b: float, x_b: float, t_inf: float) -> float:
-    """Invert a 1-D projective (cross-ratio) map: pixel-line param `t` -> real value.
-
-    Calibrated so param `t_a` <-> real value `x_a`, param `t_b` <-> real value
-    `x_b`, and param `t_inf` is the vanishing point (maps to real infinity).
-    """
-    denom = (t - t_inf) * (t_a - t_b)
-    if abs(denom) < _EPS:
-        return math.copysign(math.inf, t_a - t_b) if (t - t_inf) == 0 else x_b
-    return x_b + (x_a - x_b) * (t - t_b) * (t_a - t_inf) / denom
-
-
-def param_from_real(x: float, t_a: float, x_a: float, t_b: float, x_b: float, t_inf: float) -> float:
-    """Forward direction of `real_from_param`: real value `x` -> pixel-line param `t`."""
-    if abs(x_a - x_b) < _EPS:
-        raise ValueError("Degenerate metric reference: x_a and x_b must differ.")
-    k = (x - x_b) * (t_a - t_b) / (x_a - x_b)
-    denom = k - t_a + t_inf
-    if abs(denom) < _EPS:
-        raise ValueError("Degenerate projective solve (point maps to the vanishing point).")
-    return (k * t_inf - t_b * (t_a - t_inf)) / denom
-
-
-def fit_mobius_scale(x0: float, scale0: float, x1: float, scale1: float):
-    """Fit scale(x) = A / (B - x) from two known (position, scale) samples.
-
-    Models how pixels-per-metre for a fixed real length varies with
-    along-pitch position, which for a pinhole camera is exactly this
-    Möbius form (magnification is proportional to 1 / depth, and depth is
-    an affine function of along-pitch position).
-    """
-    if abs(scale1 - scale0) < _EPS:
-        # No detectable perspective change between the two samples - treat as
-        # a constant scale (B effectively at infinity).
-        return (scale0, math.inf)
-    b = (scale1 * x1 - scale0 * x0) / (scale1 - scale0)
-    a = scale0 * (b - x0)
-    return (a, b)
-
-
-def eval_mobius_scale(x: float, a: float, b: float) -> float:
-    if math.isinf(b):
-        return a
-    denom = b - x
-    if abs(denom) < _EPS:
-        raise ValueError(f"Position x={x} coincides with the fitted scale's singular point.")
-    return a / denom
 
 
 # --------------------------------------------------------------------------- #
@@ -160,76 +69,85 @@ class _StumpReference:
     bbox_right: Point
     base_center: Point
     top_center: Point
-    half_width_px: float
+    height_px: float
 
 
 class PitchCalibration:
-    """Pixel <-> real-world (along-pitch, lateral) mapping built from both wickets.
+    """Pixel <-> real-world (along-pitch, lateral) ground-plane mapping, built from both wickets via a single homography.
 
     Coordinate convention: X is metres from the batting end (the far /
     smaller stumps) towards the bowling end; Y is signed lateral metres
-    from the pitch centre line.
+    from the pitch centre line, positive towards the near wicket's own
+    detected left edge.
     """
 
     def __init__(self, far: _StumpReference, near: _StumpReference) -> None:
         self._far = far
         self._near = near
 
-        v_along = line_intersection(far.base_center, near.base_center, far.top_center, near.top_center)
-        if v_along is None:
+        scale_far = far.height_px / config.STUMP_HEIGHT_M
+        scale_near = near.height_px / config.STUMP_HEIGHT_M
+
+        half_pitch_w_m = config.PITCH_WIDTH_M / 2.0
+        far_half_width_px = half_pitch_w_m * scale_far
+        near_half_width_px = half_pitch_w_m * scale_near
+
+        lateral_unit = _perpendicular_unit(far, near)
+        far_left_px = _offset(far.base_center, lateral_unit, far_half_width_px)
+        far_right_px = _offset(far.base_center, lateral_unit, -far_half_width_px)
+        near_left_px = _offset(near.base_center, lateral_unit, near_half_width_px)
+        near_right_px = _offset(near.base_center, lateral_unit, -near_half_width_px)
+
+        # Ground-truth (X metres, Y metres) <-> estimated pixel corners of the
+        # real pitch rectangle, in matching order, for the homography solve.
+        world_pts = np.array(
+            [
+                [0.0, half_pitch_w_m],
+                [0.0, -half_pitch_w_m],
+                [config.PITCH_LENGTH_M, half_pitch_w_m],
+                [config.PITCH_LENGTH_M, -half_pitch_w_m],
+            ],
+            dtype=np.float32,
+        )
+        pixel_pts = np.array([far_left_px, far_right_px, near_left_px, near_right_px], dtype=np.float32)
+
+        try:
+            self._to_pixel = cv2.getPerspectiveTransform(world_pts, pixel_pts)
+            self._to_world = cv2.getPerspectiveTransform(pixel_pts, world_pts)
+        except cv2.error as exc:
             raise ValueError(
-                "Could not compute the along-pitch vanishing point — the stump "
-                "base line and top line are parallel in pixel space, which "
-                "shouldn't happen for a real perspective shot."
-            )
-        self._v_along = v_along
-
-        self._t_far_base = 0.0
-        self._t_near_base = signed_param(near.base_center, far.base_center, near.base_center)
-        self._t_v_along = signed_param(v_along, far.base_center, near.base_center)
-
-        half_w_m = config.STUMP_GROUP_WIDTH_M / 2.0
-        scale_far = far.half_width_px / half_w_m
-        scale_near = near.half_width_px / half_w_m
-        self._lateral_scale_a, self._lateral_scale_b = fit_mobius_scale(0.0, scale_far, config.PITCH_LENGTH_M, scale_near)
+                "Could not compute the pitch homography — the four estimated "
+                "boundary corners are degenerate (collinear or coincident)."
+            ) from exc
 
         logger.info(
-            "Pitch calibration built: v_along=%s far_base=%s near_base=%s "
-            "lateral_scale(px/m): far=%.1f near=%.1f",
-            _fmt_point(v_along), _fmt_point(far.base_center), _fmt_point(near.base_center),
-            scale_far, scale_near,
+            "Pitch calibration built (homography): far_base=%s near_base=%s "
+            "height_scale(px/m): far=%.1f near=%.1f pitch_half_width(px): far=%.1f near=%.1f",
+            _fmt_point(far.base_center), _fmt_point(near.base_center),
+            scale_far, scale_near, far_half_width_px, near_half_width_px,
         )
 
-    def _centerline_x_at_y(self, y: float) -> float:
-        """x-coordinate of the (near-vertical) centre line at image row *y*, extrapolated if needed."""
-        fx, fy = self._far.base_center
-        nx, ny = self._near.base_center
-        if abs(ny - fy) < _EPS:
-            raise ValueError("Degenerate centre line: far and near base points share the same image row.")
-        return fx + (nx - fx) * (y - fy) / (ny - fy)
-
-    # --- forward: pixel -> pitch metres ------------------------------------ #
-    def pixel_to_pitch(self, point: Point) -> Point:
-        """Convert a pixel coordinate to (X metres from batting end, Y lateral metres)."""
-        px, py = point
-        centerline_x = self._centerline_x_at_y(py)
-        centerline_point = (centerline_x, py)
-        t_x = signed_param(centerline_point, self._far.base_center, self._near.base_center)
-        x_m = real_from_param(t_x, self._t_far_base, 0.0, self._t_near_base, config.PITCH_LENGTH_M, self._t_v_along)
-
-        scale = eval_mobius_scale(x_m, self._lateral_scale_a, self._lateral_scale_b)
-        y_m = (px - centerline_x) / scale
-        return (x_m, y_m)
-
-    # --- inverse: pitch metres -> pixel ------------------------------------ #
+    # --- forward: pitch metres -> pixel ------------------------------------ #
     def pitch_to_pixel(self, x_m: float, y_m: float) -> Point:
         """Convert (X metres from batting end, Y lateral metres) to a pixel coordinate."""
-        t_x = param_from_real(x_m, self._t_far_base, 0.0, self._t_near_base, config.PITCH_LENGTH_M, self._t_v_along)
-        centerline_point = point_at_param(self._far.base_center, self._near.base_center, t_x)
+        return _apply_homography(self._to_pixel, (x_m, y_m))
 
-        scale = eval_mobius_scale(x_m, self._lateral_scale_a, self._lateral_scale_b)
-        px = centerline_point[0] + y_m * scale
-        return (px, centerline_point[1])
+    # --- inverse: pixel -> pitch metres ------------------------------------ #
+    def pixel_to_pitch(self, point: Point) -> Point:
+        """Convert a pixel coordinate to (X metres from batting end, Y lateral metres)."""
+        return _apply_homography(self._to_world, point)
+
+    # --- pitch boundary: straight-line projection --------------------------- #
+    def boundary_points_at(self, x_m: float) -> Tuple[Point, Point]:
+        """Return the (left, right) pixel points of the real pitch boundary (10 ft strip) at along-pitch position *x_m*.
+
+        Every real pitch marking is a straight line in the world, and a
+        homography always maps a straight line to a straight line, so
+        callers connect these (and any other `pitch_to_pixel` pair) with a
+        single straight segment — no curve-sampling is ever needed.
+        """
+        half_w = config.PITCH_WIDTH_M / 2.0
+        return self.pitch_to_pixel(x_m, half_w), self.pitch_to_pixel(x_m, -half_w)
 
     # --- reference geometry, exposed for drawing dummy stumps -------------- #
     @property
@@ -239,6 +157,43 @@ class PitchCalibration:
     @property
     def near_reference(self) -> _StumpReference:
         return self._near
+
+
+def _apply_homography(matrix: np.ndarray, point: Point) -> Point:
+    x, y = point
+    px, py, w = matrix @ np.array([x, y, 1.0])
+    if abs(w) < _EPS:
+        raise ValueError(f"Point {point} maps to infinity under this homography.")
+    return (px / w, py / w)
+
+
+def _offset(point: Point, unit: Point, distance: float) -> Point:
+    return (point[0] + unit[0] * distance, point[1] + unit[1] * distance)
+
+
+def _perpendicular_unit(far: "_StumpReference", near: "_StumpReference") -> Point:
+    """Unit vector in the image plane, perpendicular to the centre-line direction, pointing towards the "left" (bbox_left) side.
+
+    The real centre line is straight, so its image is a single straight
+    line; rotating that direction by 90 degrees gives the direction each
+    wicket's pitch-boundary corners are estimated along. The sign is fixed
+    using the near wicket's own left/right box edges (the larger, less
+    noisy box) so "left"/"right" stay consistent with the detected stump
+    orientation.
+    """
+    fx, fy = far.base_center
+    nx, ny = near.base_center
+    dx, dy = nx - fx, ny - fy
+    length = math.hypot(dx, dy)
+    if length < _EPS:
+        raise ValueError("Degenerate centre line: far and near base points coincide.")
+    ux, uy = dx / length, dy / length
+    perp = (-uy, ux)
+
+    lx, ly = near.bbox_left[0] - nx, near.bbox_left[1] - ny
+    if perp[0] * lx + perp[1] * ly < 0:
+        perp = (-perp[0], -perp[1])
+    return perp
 
 
 def _fmt_point(point: Point) -> str:
@@ -266,7 +221,7 @@ def _bbox_to_reference(bbox: BoundingBox) -> _StumpReference:
         bbox_right=(bbox.x2, bbox.y2),
         base_center=bbox.bottom_center,
         top_center=bbox.top_center,
-        half_width_px=bbox.width / 2.0,
+        height_px=bbox.height,
     )
 
 

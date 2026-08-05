@@ -16,7 +16,7 @@ import os
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Folder containing the input clips (videos) to run detection on in bulk.
-INPUT_CLIPS_DIR = r"E:\full_pitch_clips"
+INPUT_CLIPS_DIR = r"D:\ball-tracking\clips\Full_pitch_data(1)"
 
 # Root folder for annotated output videos. A run's results are written to:
 #   OUTPUT_ROOT_DIR/<today's date>/<input folder name>/<clip filename>
@@ -135,6 +135,8 @@ STUMP_GROUP_WIDTH_M = 0.2286      # 9 in, width spanning all 3 stumps of one wic
 PITCH_LENGTH_M = 20.12            # 22 yd, between the two sets of stumps
 POPPING_CREASE_OFFSET_M = 1.22    # 4 ft, in front of each set of stumps
 PITCH_WIDTH_M = 3.05              # 10 ft, prepared pitch strip width ("wide" side lines)
+RETURN_CREASE_OFFSET_M = 1.32     # 4 ft 4 in, either side of the centre line, bowling crease to popping crease
+WIDE_GUIDELINE_OFFSET_M = 0.889   # 35 in, either side of the centre line, bowling crease to popping crease
 
 # Distance markers drawn along the pitch centre line, measured in metres
 # from the batting end (the far / smaller stumps in frame).
@@ -166,8 +168,6 @@ BALL_SPEED_UNIT_CONVERSIONS = {
 # Visualisation (BGR tuples — OpenCV convention)
 # --------------------------------------------------------------------------- #
 BALL_BOX_COLOR = (0, 215, 255)
-STUMP_BOX_COLOR = (0, 255, 0)
-HUMAN_BOX_COLOR = (255, 128, 0)
 SKELETON_COLOR = (0, 165, 255)
 KEYPOINT_COLOR = (0, 0, 255)
 
@@ -177,14 +177,20 @@ SKELETON_THICKNESS = 2
 FONT_SCALE = 0.5
 FONT_THICKNESS = 1
 
-# Pitch overlay (calibration / broadcast-style graphic)
-PITCH_SIDE_LINE_COLOR = (255, 255, 255)
-PITCH_CREASE_LINE_COLOR = (255, 255, 255)
-PITCH_CENTER_LINE_COLOR = (0, 255, 255)
-PITCH_MARKER_LINE_COLOR = (0, 200, 255)
-PITCH_MARKER_TEXT_COLOR = (0, 200, 255)
-DUMMY_STUMP_COLOR = (0, 0, 255)
+# Pitch overlay (calibration / broadcast-style graphic). Colour hierarchy:
+# white = every real pitch marking (boundary, creases, return creases, wide
+# guidelines) so the pitch geometry reads as one consistent white structure;
+# accent colours are reserved for derived/guide layers (centre line, distance
+# markers) that aren't actual paint on the pitch.
+PITCH_SIDE_LINE_COLOR = (255, 255, 255)      # white — pitch boundary (10 ft strip)
+PITCH_CREASE_LINE_COLOR = (255, 255, 255)    # white — bowling & popping crease
+PITCH_CENTER_LINE_COLOR = (255, 255, 0)      # cyan — centre line
+PITCH_RETURN_CREASE_COLOR = (255, 255, 255)  # white — return crease
+PITCH_WIDE_GUIDELINE_COLOR = (255, 255, 255) # white — wide guideline
+PITCH_MARKER_LINE_COLOR = (200, 0, 255)      # magenta — full-width distance markers
+DUMMY_STUMP_COLOR = (0, 0, 255)              # red — synthetic stump redraw
 PITCH_OVERLAY_LINE_THICKNESS = 1
+PITCH_SECONDARY_LINE_THICKNESS = 1
 PITCH_MARKER_LINE_THICKNESS = 1
 DUMMY_STUMP_THICKNESS = 2
 
